@@ -221,7 +221,7 @@ class Peer:
         timeout_calc = ttl * chunks_quantity * 2
         time.sleep(timeout_calc)
         for chunk in self.request_file_chunks:
-            if self.request_file_chunks[chunk]['received'] == False:
+            if chunk in self.request_file_chunks and self.request_file_chunks[chunk]['received'] == False:
                 log(f"[Timeout] Peer {self.id} não recebeu todos os chunks do arquivo {filename}. Abortando após {timeout_calc} segundos.")
                 if request_file_lock.locked():
                     request_file_lock.release()
@@ -257,7 +257,7 @@ class Peer:
     def has_finished_receiving(self) -> bool:
         # Função para verificar se todos os chunks foram recebidos    
         for chunk in self.request_file_chunks:
-            if not self.request_file_chunks[chunk]['received']:
+            if chunk in self.request_file_chunks and not self.request_file_chunks[chunk]['received']:
                 return False
         
         log(f"Peer {self.id} recebeu todos os chunks")
@@ -284,7 +284,7 @@ class Peer:
         # Função para calcular a porcentagem de chunks recebidos
         chunks_received = 0
         for chunk in self.request_file_chunks:
-            if self.request_file_chunks[chunk]['received']:
+            if chunk in self.request_file_chunks and self.request_file_chunks[chunk]['received']:
                 chunks_received += 1
         percentage = (chunks_received / len(self.request_file_chunks)) * 100
         
