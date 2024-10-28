@@ -20,7 +20,6 @@ class Peer:
         self.speed = config[id]['speed'] 
         self.neighbors = [{'udp_address': (config[neighbor]['ip'], config[neighbor]['udp_port']), "id": neighbor} for neighbor in topology[id]]
         self.files = self.load_files()  # Arquivos que o peer possui
-        self.lock = threading.Lock()
         self.lock_tcp = threading.Lock()
         self.request_file_chunks = {}
 
@@ -32,10 +31,10 @@ class Peer:
             os.mkdir(dir_name)
         for f in os.listdir(dir_name):
             files[f] = os.path.join(dir_name, f)
+        self.files = files
         return files
 
     def udp_listener(self):
-        print("\n")
         # Escuta requisições UDP para busca de arquivos
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((self.ip, self.udp_port))
@@ -50,7 +49,7 @@ class Peer:
             if type == 'SEARCH':
                 filename, ttl, origin_peer_udp_address, origin_peer_id, request_peer_id =  message[1], int(message[2]), message[3], int(message[4]), int(message[5])
                 
-                self.files = self.load_files()  # Recarrega os arquivos locais
+                self.load_files()  # Recarrega os arquivos locais
                 
                 log(f"Peer {self.id} recebeu requisição de busca por {filename} de {origin_peer_id}")                
                 # Verifica se o peer possui algum chunk do arquivo solicitado
@@ -70,11 +69,10 @@ class Peer:
                     
                 if ttl > 0:
                     # Repassa a busca para os vizinhos
-                    self.flood_request(filename, ttl - 1, origin_peer_udp_address, origin_peer_id, request_peer_id)
+                    self.flood_request(filename, ttl, origin_peer_udp_address, origin_peer_id, request_peer_id)
                     
             elif type == 'FOUND':
                 chunk, peer_udp_address, origin_id = message[1], message[2], int(message[3])
-                
                 if chunk in self.request_file_chunks:
                     if self.request_file_chunks[chunk]['found'] == False:
                         log(f"Peer {self.id} vai receber {chunk} de {origin_id}")
@@ -102,15 +100,15 @@ class Peer:
                                    
     def flood_request(self, filename, ttl, origin_peer_udp_address, origin_peer_id, request_peer_id):
         # Envia requisição de busca para os peers vizinhos
-        message = f'SEARCH|{filename}|{ttl}|{origin_peer_udp_address}|{origin_peer_id}|{self.id}'
+        message = f'SEARCH|{filename}|{ttl - 1}|{origin_peer_udp_address}|{origin_peer_id}|{self.id}'
         
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
         for neighbor in self.neighbors:
             if (origin_peer_id == neighbor['id'] or request_peer_id == neighbor['id']):
                 continue
-
-            log(f"Peer {self.id} enviou requisição para Peer {neighbor['id']}")
+            time.sleep(1)  # Aguarda 1 segundo para evitar congestionamento
+            log(f"Peer {self.id} enviou requisição de {filename} para Peer {neighbor['id']}")
             sock.sendto(message.encode(), neighbor['udp_address'])
 
     def tcp_transfer(self, chunk, target_peer):
@@ -124,19 +122,19 @@ class Peer:
                 filename = chunk
                 s.sendall(filename.encode('utf-8'))
                 
-                log(f"Peer {self.id} enviou filename para {target_peer}")
+                # log(f"Peer {self.id} enviou filename para {target_peer}")
                 
                 # Envia o id do peer
                 sender_id = f"id:{self.id}"
                 s.sendall(sender_id.encode('utf-8'))
                 
-                log(f"Peer {self.id} enviou id para {target_peer}")
+                # log(f"Peer {self.id} enviou id para {target_peer}")
                 
                 # Envia a velocidade de transferência
                 transfer_speed = f"speed:{self.speed}"
                 s.sendall(transfer_speed.encode('utf-8'))
                 
-                log(f"Peer {self.id} enviou velocidade para {target_peer}")
+                # log(f"Peer {self.id} enviou velocidade para {target_peer}")
 
                 file_path = f"{self.id}/{chunk}"
 
@@ -152,6 +150,9 @@ class Peer:
                 log(f"Transferência de {chunk} para {target_peer} concluída.")
         except Exception as e:
             log(f"Erro ao transferir {chunk} para {target_peer}: {e}")
+            
+            log(f"Tentando novamente transferir {chunk} para {target_peer}")
+            self.tcp_transfer(chunk, target_peer)
 
     def tcp_listener(self):
         log(f"Peer {self.id} esperando por transferência TCP")
@@ -215,22 +216,46 @@ class Peer:
             
             self.lock_tcp.release()
         
+    def search_chunks_timeout(self, filename, ttl, chunks_quantity):
+        # Deve finalizar a espera por chunks após um tempo
+        timeout_calc = ttl * chunks_quantity * 2
+        time.sleep(timeout_calc)
+        for chunk in self.request_file_chunks:
+            if self.request_file_chunks[chunk]['received'] == False:
+                log(f"[Timeout] Peer {self.id} não recebeu todos os chunks do arquivo {filename}. Abortando após {timeout_calc} segundos.")
+                request_file_lock.release()
+                self.lock_tcp.release()
+                self.request_file_chunks = {}
             
     def request_file(self, filename, ttl, chunks):
+        self.load_files() # Recarrega os arquivos locais
+        
         request_file_lock.acquire()
         # Função para requisitar um arquivo com TTL inicial
         log(f"Peer {self.id} solicitando arquivo {filename} com TTL {ttl}")
-        self.flood_request(filename, ttl, f"{self.ip}:{self.udp_port}", self.id, self.id)
+
         self.request_file_chunks = {}
         for i in range(chunks):
             self.request_file_chunks[f"{filename}.ch{i}"] = {'found': False, 'received': False, 'sender_id': None, 'id': i}
-        return
+        
+        # Verifica se já tem algum chunk do arquivo
+        for chunk in self.files:
+            if chunk.startswith(filename) and chunk in self.request_file_chunks:
+                log(f"Peer {self.id} já possui {chunk}")
+                self.request_file_chunks[chunk]['found'] = True
+                self.request_file_chunks[chunk]['received'] = True
+                self.request_file_chunks[chunk]['sender_id'] = self.id
+                
+        has_all_chunks = self.has_finished_receiving()
+        if has_all_chunks == False:
+            self.flood_request(filename, ttl, f"{self.ip}:{self.udp_port}", self.id, self.id)
+            threading.Thread(target=self.search_chunks_timeout, args=(filename, ttl, chunks)).start()
             
-    def has_finished_receiving(self):
+    def has_finished_receiving(self) -> bool:
         # Função para verificar se todos os chunks foram recebidos    
         for chunk in self.request_file_chunks:
             if not self.request_file_chunks[chunk]['received']:
-                return
+                return False
         
         log(f"Peer {self.id} recebeu todos os chunks")
         
@@ -249,6 +274,7 @@ class Peer:
         
         self.request_file_chunks = {}
         request_file_lock.release()
+        return True
                       
     def calculate_chuncks_percentage(self, sender_id, chunk):
         # Função para calcular a porcentagem de chunks recebidos
@@ -258,7 +284,7 @@ class Peer:
                 chunks_received += 1
         percentage = (chunks_received / len(self.request_file_chunks)) * 100
         
-        log(f"Peer {self.id} recebeu {chunk} de {sender_id} ({percentage:.2f}%)")
+        log(f"Peer {self.id} recebeu {chunk} de {sender_id} ({percentage:.0f}%)")
 
     def start(self):
         # Inicia o thread para UDP listener
@@ -321,12 +347,17 @@ if __name__ == "__main__":
     while True:
         if request_file_lock.locked():
             request_file_lock.release()
-        metadata_file = input("Digite o nome do arquivo de metadados (exemplo: arquivo.p2p): ")
+        metadata_file = input("Digite o nome do arquivo de metadados (exemplo: arquivo.p2p): \n")
+        
+        if not os.path.exists(metadata_file):
+            log("Arquivo de metadados não encontrado")
+            continue
+        
         metadata = load_metadata(metadata_file)
         
         peer.request_file(metadata['filename'], metadata['ttl'], metadata['chunks'])
         request_file_lock.acquire()
         
 
-        log("Arquivo recebido com sucesso")
+        log("\n----- Operação concluída -----\n")
         
