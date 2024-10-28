@@ -213,8 +213,8 @@ class Peer:
                 self.request_file_chunks[filename]['sender_id'] = sender_id
                 self.calculate_chuncks_percentage(addr, filename)
                 self.has_finished_receiving()
-            
-            self.lock_tcp.release()
+            if self.lock_tcp.locked():
+                self.lock_tcp.release()
         
     def search_chunks_timeout(self, filename, ttl, chunks_quantity):
         # Deve finalizar a espera por chunks após um tempo
@@ -223,8 +223,11 @@ class Peer:
         for chunk in self.request_file_chunks:
             if self.request_file_chunks[chunk]['received'] == False:
                 log(f"[Timeout] Peer {self.id} não recebeu todos os chunks do arquivo {filename}. Abortando após {timeout_calc} segundos.")
-                request_file_lock.release()
-                self.lock_tcp.release()
+                if request_file_lock.locked():
+                    request_file_lock.release()
+                if self.lock_tcp.locked():
+                    self.lock_tcp.release()
+                    
                 self.request_file_chunks = {}
             
     def request_file(self, filename, ttl, chunks):
@@ -273,7 +276,8 @@ class Peer:
         
         
         self.request_file_chunks = {}
-        request_file_lock.release()
+        if request_file_lock.locked():
+            request_file_lock.release()
         return True
                       
     def calculate_chuncks_percentage(self, sender_id, chunk):
