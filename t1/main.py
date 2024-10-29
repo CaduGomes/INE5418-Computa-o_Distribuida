@@ -16,12 +16,12 @@ class Peer:
         self.id = id
         self.ip = config[id]['ip']
         self.udp_port = config[id]['udp_port']
-        self.tcp_port = config[id]['udp_port'] + 1000
+        self.tcp_port = int(config[id]['udp_port']) + (100 * id)
         self.speed = config[id]['speed'] 
         self.neighbors = [{'udp_address': (config[neighbor]['ip'], config[neighbor]['udp_port']), "id": neighbor} for neighbor in topology[id]]
         self.files = self.load_files()  # Arquivos que o peer possui
-        self.lock_tcp = threading.Lock()
         self.request_file_chunks = {}
+        self.timeout_occurred = False
 
     def load_files(self):
         # Carrega chunks de arquivos que o peer tem localmente
@@ -39,6 +39,10 @@ class Peer:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((self.ip, self.udp_port))
         while True:
+            
+            if self.timeout_occurred:
+                break
+            
             data, addr = sock.recvfrom(1024)
             message = data.decode().split('|')
             
@@ -80,10 +84,10 @@ class Peer:
                         self.request_file_chunks[chunk]['found'] = True
                         # Envia requisição UDP com o ip e porta para receber o chunk via TCP
                         
-                        self.lock_tcp.acquire()
-                        threading.Thread(target=self.tcp_listener).start()
+                        chunk_id = self.request_file_chunks[chunk]['id']
+                        threading.Thread(target=self.tcp_listener, args=(chunk_id,)).start()
 
-                        response_message = f'SEND|{chunk}|{self.ip}:{self.tcp_port}|{self.id}'
+                        response_message = f'SEND|{chunk}|{self.ip}:{self.tcp_port + chunk_id}|{self.id}'
                         peer_addr = tuple(peer_udp_address.split(':'))
                         sock.sendto(response_message.encode(), (peer_addr[0], int(peer_addr[1])))
 
@@ -118,35 +122,24 @@ class Peer:
                 s.settimeout(5)  # Define o timeout de 5 segundos para operações de socket
                 s.connect(target_peer)
                 log(f"Peer {self.id} conectado a {target_peer}")
-                # Envia o nome do arquivo
-                filename = chunk
-                s.sendall(filename.encode('utf-8'))
-                
-                # log(f"Peer {self.id} enviou filename para {target_peer}")
-                
-                # Envia o id do peer
-                sender_id = f"id:{self.id}"
-                s.sendall(sender_id.encode('utf-8'))
-                
-                # log(f"Peer {self.id} enviou id para {target_peer}")
-                
-                # Envia a velocidade de transferência
-                transfer_speed = f"speed:{self.speed}"
-                s.sendall(transfer_speed.encode('utf-8'))
-                
-                # log(f"Peer {self.id} enviou velocidade para {target_peer}")
-
                 file_path = f"{self.id}/{chunk}"
-
                 with open(file_path, 'rb') as f:
+                    data = f.read()
+                    
+                    # filename + data
+                    data_to_send = f"{chunk}|----|".encode() + data
+                    
+                    for i in range(0, len(data_to_send), self.speed):
+                        s.sendall(data_to_send[i:i+self.speed])
+                        time.sleep(1)
+                        
+                        percentage = (i + self.speed) / len(data_to_send) * 100
+                        
+                        if percentage > 100:
+                            percentage = 100
 
-                    while True:
-                        data = f.read(self.speed)
-                        if not data:
-                            break
-                        s.sendall(data)
-
-                time.sleep(1) 
+                        log(f"Enviando {chunk} para {target_peer} ({percentage:.0f}%)")
+                    
                 log(f"Transferência de {chunk} para {target_peer} concluída.")
         except Exception as e:
             log(f"Erro ao transferir {chunk} para {target_peer}: {e}")
@@ -154,79 +147,60 @@ class Peer:
             log(f"Tentando novamente transferir {chunk} para {target_peer}")
             self.tcp_transfer(chunk, target_peer)
 
-    def tcp_listener(self):
+    def tcp_listener(self, chunk_id):
+        if self.timeout_occurred:
+            return
+            
         log(f"Peer {self.id} esperando por transferência TCP")
         filename = None
-        sender_id = None
         try:
             # Escuta requisições de TCP para transferência de chunks
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Permitir reutilização de endereço
-            sock.bind((self.ip, self.tcp_port))
+            sock.bind((self.ip, self.tcp_port + chunk_id))
             sock.listen()
             conn, addr = sock.accept()
             with conn:
-                filename = conn.recv(1024)
+               
+                full_data = b''
                 
-                if not filename:
-                    log(f"Peer {self.id} não recebeu nome do arquivo")
-                    return
-                
-                filename = filename.decode('utf-8')
-                
-                if filename not in self.request_file_chunks:
-                    log(f"Peer {self.id} não solicitou {filename}")
-                    return
-                
-                sender_id = conn.recv(1024)
-                
-                if not sender_id:
-                    log(f"Peer {self.id} não recebeu id do sender")
-                    return
-                
-                sender_id = int(sender_id.decode('utf-8').split(':')[1])
-                
-                if sender_id != self.request_file_chunks[filename]['sender_id']:
-                    log(f"Peer {self.id} não solicitou {filename}")
-                    return
-                
-                
-                transfer_speed = conn.recv(1024)
-                
-                if not transfer_speed:
-                    log(f"Peer {self.id} não recebeu velocidade de transferência")
-                    return
-                
-                transfer_speed = int(transfer_speed.decode('utf-8').split(':')[1])
+                while True:
+                    if self.timeout_occurred:
+                        break
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                    full_data += data
+               
+                filename = full_data.split(b'|----|')[0].decode()
+
+                file_data = full_data.split(b'|----|')[1]
                 
                 file_path = f"{self.id}/{filename}"
-                with open(file_path, 'wb') as f:
-                    while True:
-                        data = conn.recv(transfer_speed)
-                        if not data:
-                            break
-                        f.write(data)
+                
+                if self.timeout_occurred:
+                        return
+                with open(file_path, 'ab') as f:
+                    f.write(file_data)
+            
+            log (f"Peer {self.id} recebeu {filename} de {addr}")
         finally:
             # Liberar o lock_tcp
-            if filename in self.request_file_chunks and sender_id == self.request_file_chunks[filename]['sender_id']:
+            if filename and filename in self.request_file_chunks:
                 self.request_file_chunks[filename]['received'] = True
-                self.request_file_chunks[filename]['sender_id'] = sender_id
                 self.calculate_chuncks_percentage(addr, filename)
                 self.has_finished_receiving()
-            if self.lock_tcp.locked():
-                self.lock_tcp.release()
         
     def search_chunks_timeout(self, filename, ttl, chunks_quantity):
         # Deve finalizar a espera por chunks após um tempo
         timeout_calc = ttl * chunks_quantity * 2
         time.sleep(timeout_calc)
         for chunk in self.request_file_chunks:
-            if chunk in self.request_file_chunks and self.request_file_chunks[chunk]['received'] == False:
-                log(f"[Timeout] Peer {self.id} não recebeu todos os chunks do arquivo {filename}. Abortando após {timeout_calc} segundos.")
+            if chunk in self.request_file_chunks and self.request_file_chunks[chunk]['found'] == False:
+                self.timeout_occurred = True
+                log(f"[Timeout] Peer {self.id} não encontrou todos os chunks do arquivo {filename}. Abortando após {timeout_calc} segundos.")
                 if request_file_lock.locked():
                     request_file_lock.release()
-                if self.lock_tcp.locked():
-                    self.lock_tcp.release()
                     
                 self.request_file_chunks = {}
             
